@@ -1,69 +1,86 @@
 // main.js
-require("dotenv").config();
-
 const fs = require("fs");
 const { spawn } = require("child_process");
 const path = require("path");
 const fetch = require("node-fetch");
+const { ProxyAgent } = require("proxy-agent");
 
-// ---------- CONFIG VIA ENV ----------
+// ---------------------------------------
+// CONTACTS FILE (username:userId:email per line)
+// ---------------------------------------
+const CONTACT_FILE = path.join(__dirname, "contacts.txt");
 
-const CONTACT_FILE = process.env.CONTACT_FILE || "contacts.txt";
-
-const MAX_PER_HOUR = Number(process.env.MAX_PER_HOUR || 10);
-const MIN_DELAY_SECONDS = Number(process.env.MIN_DELAY_SECONDS || 330); // 5.5 min
-const MAX_DELAY_SECONDS = Number(process.env.MAX_DELAY_SECONDS || 420); // 7 min
-
-// which python executable to use
-const PYTHON_BIN = process.env.PYTHON_BIN || "python";
-
-const HOUR_MS = 60 * 60 * 1000;
-
-// ------------------------------------
-
-const sendTimestamps = [];
+// ---------------------------------------
+// TIMING CONFIG – 1 email every 60 seconds
+// ---------------------------------------
+const DELAY_MS = 60 * 1000; // 1 minute
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function randomDelay() {
-  const minMs = MIN_DELAY_SECONDS * 1000;
-  const maxMs = MAX_DELAY_SECONDS * 1000;
-  const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-  const sec = Math.round(ms / 1000);
-  console.log(`Waiting ${sec}s before next email...`);
-  return sleep(ms);
-}
-
-async function enforceRateLimit() {
-  const now = Date.now();
-
-  // Remove timestamps older than 1 hour
-  for (let i = sendTimestamps.length - 1; i >= 0; i--) {
-    if (now - sendTimestamps[i] > HOUR_MS) {
-      sendTimestamps.splice(i, 1);
-    }
+// ---------------------------------------
+// YAHOO ACCOUNTS – ROTATE PER EMAIL
+// Load from environment variable as JSON string
+// Format: [{"email":"user@yahoo.com","appPassword":"pass"},{"email":"user2@yahoo.com","appPassword":"pass2"}]
+// ---------------------------------------
+function getEmailAccounts() {
+  const envAccounts = process.env.EMAIL_ACCOUNTS;
+  if (!envAccounts) {
+    throw new Error("EMAIL_ACCOUNTS environment variable is required");
   }
-
-  if (sendTimestamps.length >= MAX_PER_HOUR) {
-    const oldest = sendTimestamps[0];
-    const waitMs = HOUR_MS - (now - oldest) + 5_000;
-    const mins = (waitMs / 1000 / 60).toFixed(1);
-    console.log(
-      `Hourly cap reached (${sendTimestamps.length}/${MAX_PER_HOUR}). Pausing ~${mins} minutes...`
-    );
-    await sleep(waitMs);
+  try {
+    return JSON.parse(envAccounts);
+  } catch (e) {
+    throw new Error("EMAIL_ACCOUNTS must be valid JSON array");
   }
 }
 
-/**
- * Pop first valid contact from CONTACT_FILE
- * Format: username:userId:email
- */
+const EMAIL_ACCOUNTS = getEmailAccounts();
+
+let currentAccountIndex = 0;
+
+function getNextAccount() {
+  const acc = EMAIL_ACCOUNTS[currentAccountIndex];
+  currentAccountIndex = (currentAccountIndex + 1) % EMAIL_ACCOUNTS.length;
+  return acc;
+}
+
+// ---------------------------------------
+// IPROYAL PROXIES – ROTATE PER ROBLOX REQUEST
+// Load from environment variable as JSON array
+// Format: ["http://user:pass@geo.iproyal.com:12321","http://user2:pass2@geo.iproyal.com:12321"]
+// ---------------------------------------
+function getProxies() {
+  const envProxies = process.env.PROXIES;
+  if (!envProxies) {
+    console.warn("PROXIES environment variable not set, running without proxy");
+    return [];
+  }
+  try {
+    return JSON.parse(envProxies);
+  } catch (e) {
+    throw new Error("PROXIES must be valid JSON array");
+  }
+}
+
+const PROXIES = getProxies();
+
+let currentProxyIndex = 0;
+
+function getNextProxy() {
+  if (!PROXIES.length) return null;
+  const proxy = PROXIES[currentProxyIndex];
+  currentProxyIndex = (currentProxyIndex + 1) % PROXIES.length;
+  return proxy;
+}
+
+// ---------------------------------------
+// CONTACT PARSER (pop first line, rewrite file)
+// ---------------------------------------
 function getNextContact() {
   if (!fs.existsSync(CONTACT_FILE)) {
-    console.error(`Contacts file not found: ${CONTACT_FILE}`);
+    console.error("contacts.txt missing!");
     return null;
   }
 
@@ -72,79 +89,105 @@ function getNextContact() {
     .split(/\r?\n/)
     .filter((l) => l.trim().length > 0);
 
-  if (lines.length === 0) {
-    return null;
-  }
+  if (lines.length === 0) return null;
 
   const first = lines[0].trim();
   const parts = first.split(":");
+
   if (parts.length < 3) {
-    console.error("Invalid contact line (expected username:userId:email):", first);
+    console.error("Invalid contact line:", first);
     fs.writeFileSync(CONTACT_FILE, lines.slice(1).join("\n"), "utf8");
     return getNextContact();
   }
 
   const [username, userIdStr, email] = parts;
   const userId = parseInt(userIdStr, 10);
+
   if (isNaN(userId)) {
     console.error("Invalid userId in contact line:", first);
     fs.writeFileSync(CONTACT_FILE, lines.slice(1).join("\n"), "utf8");
     return getNextContact();
   }
 
-  // rewrite contacts without the first line
+  // Remove this line from contacts immediately (consumed)
   fs.writeFileSync(CONTACT_FILE, lines.slice(1).join("\n"), "utf8");
 
   return { username, userId, email };
 }
 
-/**
- * Fetch top limited name via Roblox API.
- * Returns null if inventory private / terminated / no limiteds / error.
- */
-async function getTopLimitedName(userId) {
+// ---------------------------------------
+// ROBLOX LIMITED SCRAPER + RAP CHECK (with proxies)
+// Returns { topItemName, totalRap } or null
+// null = no collectibles
+// throws = real error (network/proxy/etc.)
+// ---------------------------------------
+async function getTopLimitedInfo(userId) {
   const url = `https://inventory.roblox.com/v1/users/${userId}/assets/collectibles?sortOrder=Asc&limit=100`;
 
-  let res;
-  try {
-    res = await fetch(url, { headers: { Accept: "application/json" } });
-  } catch (err) {
-    console.error(`Network error talking to Roblox for ${userId}:`, err.message);
-    return null;
+  const proxy = getNextProxy();
+  const fetchOptions = {
+    headers: { Accept: "application/json" },
+  };
+
+  if (proxy) {
+    const agent = new ProxyAgent(proxy);
+    fetchOptions.agent = agent;
+    console.log(`Using proxy for user ${userId} (${currentProxyIndex + 1}/${PROXIES.length})`);
+  } else {
+    console.log(`No proxy in use for user ${userId}`);
+  }
+
+  const res = await fetch(url, fetchOptions);
+
+  // 407 = Proxy Authentication Required (from IPRoyal, not Roblox)
+  if (res.status === 407) {
+    throw new Error(
+      `Proxy authentication failed (HTTP 407). Check IPRoyal credentials.`
+    );
   }
 
   if (!res.ok) {
-    console.log(`Roblox API error ${res.status} for user ${userId}`);
-    return null;
+    throw new Error(`Roblox API status ${res.status} ${res.statusText}`);
   }
 
   const json = await res.json();
   const data = Array.isArray(json.data) ? json.data : [];
 
   if (data.length === 0) {
+    // no visible collectibles, but not an error
     return null;
+  }
+
+  let totalRap = 0;
+  for (const item of data) {
+    totalRap += item.recentAveragePrice || 0;
   }
 
   data.sort(
     (a, b) => (b.recentAveragePrice || 0) - (a.recentAveragePrice || 0)
   );
+
   const top = data[0];
-  return top && top.name ? top.name : null;
+  if (!top || !top.name) return null;
+
+  return { topItemName: top.name, totalRap };
 }
 
-/**
- * Call Python script to send email via Yahoo SMTP.
- */
-function sendEmailWithPython(toEmail, username, topItem) {
+// ---------------------------------------
+// PYTHON EMAIL SENDER
+// ---------------------------------------
+function sendEmailWithPython(account, toEmail, username, topItem) {
   return new Promise((resolve, reject) => {
     const args = [
       path.join(__dirname, "send_email.py"),
+      account.email,
+      account.appPassword,
       toEmail,
       username,
-      topItem
+      topItem,
     ];
 
-    const py = spawn(PYTHON_BIN, args, { stdio: "inherit" });
+    const py = spawn("python", args, { stdio: "inherit" });
 
     py.on("error", (err) => reject(err));
     py.on("close", (code) => {
@@ -154,47 +197,62 @@ function sendEmailWithPython(toEmail, username, topItem) {
   });
 }
 
-// -------------- MAIN LOOP --------------
-
+// ---------------------------------------
+// MAIN LOOP – 1 email every 60 seconds
+// ---------------------------------------
 (async () => {
-  console.log("=== Email bot started (10/hr cap, Roblox-gated) ===");
+  console.log(
+    "=== Email bot started (contacts.txt, RAP >= 100k, 1/minute, rotating Yahoo + IPRoyal proxy) ==="
+  );
 
   while (true) {
     const contact = getNextContact();
     if (!contact) {
-      console.log("No contacts left. All done.");
+      console.log("No contacts left. Finished.");
       break;
     }
 
     const { username, userId, email } = contact;
     console.log(`\nProcessing ${username} (${userId}) <${email}>`);
 
-    let topItem = null;
+    let info;
     try {
-      topItem = await getTopLimitedName(userId);
+      info = await getTopLimitedInfo(userId);
     } catch (e) {
-      console.log("Unexpected Roblox logic error:", e.message);
+      console.error(`FATAL proxy/Roblox error: ${e.message}`);
+      console.error(
+        "This looks like an IPRoyal configuration issue (wrong port/creds/auth mode). Stopping script."
+      );
+      process.exit(1);
     }
 
-    if (!topItem) {
-      console.log(
-        "No visible collectibles (terminated, private inventory, or no limiteds). Skipping this contact."
-      );
+    if (!info) {
+      console.log("No visible collectibles (private/terminated/empty). Skipping.");
       continue;
     }
 
-    console.log(`Top item detected: ${topItem}`);
+    const { topItemName, totalRap } = info;
 
-    await enforceRateLimit();
-
-    try {
-      await sendEmailWithPython(email, username, topItem);
-      sendTimestamps.push(Date.now());
-      console.log("Done for this contact.");
-    } catch (err) {
-      console.error("Failed to send email for this contact:", err.message);
+    if (totalRap < 100000) {
+      console.log(`Total RAP = ${totalRap} (< 100000). Skipping user.`);
+      continue;
     }
 
-    await randomDelay();
+    console.log(`Top item detected: ${topItemName} | Total RAP: ${totalRap}`);
+
+    const account = getNextAccount();
+    console.log(`Sending from ${account.email} to ${email}...`);
+
+    try {
+      await sendEmailWithPython(account, email, username, topItemName);
+      console.log("Email sent successfully.");
+    } catch (err) {
+      console.error("Failed to send email:", err.message);
+    }
+
+    console.log(`Waiting 60 seconds before next email...`);
+    await sleep(DELAY_MS);
   }
+
+  console.log("\n=== Done ===");
 })();
