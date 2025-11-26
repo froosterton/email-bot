@@ -9,6 +9,47 @@ const { ProxyAgent } = require("proxy-agent");
 // CONTACTS FILE (username:userId:email per line)
 // ---------------------------------------
 const CONTACT_FILE = path.join(__dirname, "contacts.txt");
+const CHECKPOINT_FILE = path.join(__dirname, "checkpoint.txt");
+
+// Create contacts.txt if it doesn't exist
+if (!fs.existsSync(CONTACT_FILE)) {
+  fs.writeFileSync(CONTACT_FILE, "", "utf8");
+  console.log("Created empty contacts.txt file. Please upload your contacts file.");
+}
+
+// ---------------------------------------
+// CHECKPOINT FUNCTIONS
+// ---------------------------------------
+function saveCheckpoint(contactLine) {
+  try {
+    fs.writeFileSync(CHECKPOINT_FILE, contactLine, "utf8");
+  } catch (e) {
+    console.warn("Failed to save checkpoint:", e.message);
+  }
+}
+
+function loadCheckpoint() {
+  if (!fs.existsSync(CHECKPOINT_FILE)) {
+    return null;
+  }
+  try {
+    const checkpoint = fs.readFileSync(CHECKPOINT_FILE, "utf8").trim();
+    return checkpoint || null;
+  } catch (e) {
+    console.warn("Failed to load checkpoint:", e.message);
+    return null;
+  }
+}
+
+function clearCheckpoint() {
+  if (fs.existsSync(CHECKPOINT_FILE)) {
+    try {
+      fs.unlinkSync(CHECKPOINT_FILE);
+    } catch (e) {
+      console.warn("Failed to clear checkpoint:", e.message);
+    }
+  }
+}
 
 // ---------------------------------------
 // TIMING CONFIG – 1 email every 60 seconds
@@ -77,17 +118,24 @@ function getNextProxy() {
 
 // ---------------------------------------
 // CONTACT PARSER (pop first line, rewrite file)
+// Now with checkpoint support - skips to last processed contact on restart
 // ---------------------------------------
-function getNextContact() {
+function getAllContacts() {
   if (!fs.existsSync(CONTACT_FILE)) {
     console.error("contacts.txt missing!");
-    return null;
+    return [];
   }
 
   const lines = fs
     .readFileSync(CONTACT_FILE, "utf8")
     .split(/\r?\n/)
     .filter((l) => l.trim().length > 0);
+
+  return lines;
+}
+
+function getNextContact() {
+  const lines = getAllContacts();
 
   if (lines.length === 0) return null;
 
@@ -112,7 +160,37 @@ function getNextContact() {
   // Remove this line from contacts immediately (consumed)
   fs.writeFileSync(CONTACT_FILE, lines.slice(1).join("\n"), "utf8");
 
-  return { username, userId, email };
+  return { username, userId, email, originalLine: first };
+}
+
+function skipToCheckpoint() {
+  const checkpoint = loadCheckpoint();
+  if (!checkpoint) {
+    return; // No checkpoint, start from beginning
+  }
+
+  console.log(`Resuming from checkpoint: ${checkpoint}`);
+  const lines = getAllContacts();
+
+  if (lines.length === 0) {
+    console.log("No contacts found, clearing checkpoint.");
+    clearCheckpoint();
+    return;
+  }
+
+  // Find the checkpoint in the file
+  const checkpointIndex = lines.findIndex((line) => line.trim() === checkpoint);
+
+  if (checkpointIndex === -1) {
+    console.log("Checkpoint not found in contacts file. Starting from beginning.");
+    clearCheckpoint();
+    return;
+  }
+
+  // Remove all lines up to and including the checkpoint
+  const remainingLines = lines.slice(checkpointIndex + 1);
+  fs.writeFileSync(CONTACT_FILE, remainingLines.join("\n"), "utf8");
+  console.log(`Skipped ${checkpointIndex + 1} contacts (already processed). ${remainingLines.length} contacts remaining.`);
 }
 
 // ---------------------------------------
@@ -205,14 +283,18 @@ function sendEmailWithPython(account, toEmail, username, topItem) {
     "=== Email bot started (contacts.txt, RAP >= 100k, 1/minute, rotating Yahoo + IPRoyal proxy) ==="
   );
 
+  // Skip to checkpoint on startup
+  skipToCheckpoint();
+
   while (true) {
     const contact = getNextContact();
     if (!contact) {
       console.log("No contacts left. Finished.");
+      clearCheckpoint();
       break;
     }
 
-    const { username, userId, email } = contact;
+    const { username, userId, email, originalLine } = contact;
     console.log(`\nProcessing ${username} (${userId}) <${email}>`);
 
     let info;
@@ -223,11 +305,15 @@ function sendEmailWithPython(account, toEmail, username, topItem) {
       console.error(
         "This looks like an IPRoyal configuration issue (wrong port/creds/auth mode). Stopping script."
       );
+      // Save checkpoint before exiting so we can resume
+      saveCheckpoint(originalLine);
       process.exit(1);
     }
 
     if (!info) {
       console.log("No visible collectibles (private/terminated/empty). Skipping.");
+      // Save checkpoint even for skipped contacts
+      saveCheckpoint(originalLine);
       continue;
     }
 
@@ -235,6 +321,8 @@ function sendEmailWithPython(account, toEmail, username, topItem) {
 
     if (totalRap < 100000) {
       console.log(`Total RAP = ${totalRap} (< 100000). Skipping user.`);
+      // Save checkpoint even for skipped contacts
+      saveCheckpoint(originalLine);
       continue;
     }
 
@@ -249,6 +337,9 @@ function sendEmailWithPython(account, toEmail, username, topItem) {
     } catch (err) {
       console.error("Failed to send email:", err.message);
     }
+
+    // Save checkpoint after processing (whether email sent or failed)
+    saveCheckpoint(originalLine);
 
     console.log(`Waiting 60 seconds before next email...`);
     await sleep(DELAY_MS);
