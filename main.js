@@ -295,6 +295,14 @@ function sendEmailWithPython(account, toEmail, username, topItem) {
     }
 
     const { username, userId, email, originalLine } = contact;
+    
+    // Skip contacts with invalid emails
+    if (!email || email.trim().toUpperCase() === "N/A" || !email.includes("@")) {
+      console.log(`Skipping ${username} - invalid or missing email: ${email}`);
+      saveCheckpoint(originalLine);
+      continue;
+    }
+    
     console.log(`\nProcessing ${username} (${userId}) <${email}>`);
 
     let info;
