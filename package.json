@@ -4,12 +4,17 @@
   "main": "main.js",
   "scripts": {
     "start": "node main.js",
-    "watch-replies": "node reply_watcher.js"
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "imapflow": "^1.0.0",
-    "mailparser": "^3.9.0",
-    "node-fetch": "^2.7.0"
+    "node-fetch": "^2.7.0",
+    "proxy-agent": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
