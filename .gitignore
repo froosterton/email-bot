@@ -1,8 +1,8 @@
 node_modules/
 contacts.txt
+checkpoint.txt
 .env
 __pycache__/
 *.pyc
 .DS_Store
 *.log
-checkpoint.txt
