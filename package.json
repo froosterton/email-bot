@@ -12,7 +12,7 @@
   "description": "",
   "dependencies": {
     "node-fetch": "^2.7.0",
-    "proxy-agent": "^7.0.0"
+    "proxy-agent": "^6"
   },
   "engines": {
     "node": ">=16.0.0"
