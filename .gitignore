@@ -1,5 +1,7 @@
 node_modules/
-.env
 contacts.txt
+.env
 __pycache__/
 *.pyc
+.DS_Store
+*.log
